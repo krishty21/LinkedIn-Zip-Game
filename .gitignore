@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+.venv.bak/
+
+# Project specific
+*.png
+*.jpg
+*.zip
+cells.txt
+full_dom.html
+.browser_data/
+*.pth
