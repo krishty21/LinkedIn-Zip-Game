@@ -547,33 +547,29 @@ async def _navigate_and_wait(page, game_url: str, timeout_ms: int) -> None:
     ]:
         try:
             btn = page.locator(selector).first
-            await btn.wait_for(state="visible", timeout=500)
+            await btn.wait_for(state="visible", timeout=3000)
             await btn.click()
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
         except Exception:
             pass
 
-    # Wait for the grid to render. Try multiple selectors.
-    for selector in [
-        "[data-testid='interactive-grid']",
-        "[data-cell-idx]",
-        "canvas",
-    ]:
-        try:
-            loc = page.locator(selector).first
-            await loc.wait_for(state="visible", timeout=timeout_ms)
-            return
-        except Exception:
-            continue
+    # Wait for the grid to render using a combined selector.
+    try:
+        combined_selector = "[data-testid='interactive-grid'], [data-cell-idx], canvas"
+        loc = page.locator(combined_selector).first
+        await loc.wait_for(state="visible", timeout=timeout_ms)
+        return
+    except Exception:
+        pass
     raise VisionError(
-        "No visible game board found. Are you logged into LinkedIn?"
+        f"No visible game board found after {timeout_ms//1000}s. Make sure you click 'Start Game'."
     )
 
 
 async def capture_canvas_screenshot(
     context,
     game_url: str = DEFAULT_GAME_URL,
-    page_timeout_ms: int = 15_000,
+    page_timeout_ms: int = 60_000,
 ) -> Tuple[object, np.ndarray, Tuple[int, int, int, int]]:
     """Navigate, wait for the board, and capture a screenshot + bbox."""
     # Always open a fresh tab — in persistent profiles, pages[0] can be a
