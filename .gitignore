@@ -17,4 +17,6 @@ venv.bak/
 cells.txt
 full_dom.html
 .browser_data/
+chrome_profile/
 *.pth
+!zip_cnn.pth

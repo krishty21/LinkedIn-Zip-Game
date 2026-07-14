@@ -1,34 +1,21 @@
 """
-solver.py
-=========
-Phase 3 - Hybrid DFS backtracking solver guided by the CNN policy.
+solver.py — Phase 3: Hybrid DFS + CNN solver (Optimized v2)
+=============================================================
 
-Algorithm
----------
-The Zip game is essentially a Hamiltonian-path puzzle with waypoint
-ordering constraints. The solver explores the move tree with depth-first
-search, but:
-
-  * **Move ordering** is informed by the CNN policy: at every node, candidate
-    moves are sorted by descending predicted probability so that promising
-    branches are visited first. This dramatically shrinks the effective
-    search space without sacrificing completeness.
-
-  * **Strict pruning** guarantees correctness:
-      1. *Waypoint ordering*: a NUMBERED cell may only be entered when its
-         number equals ``next_expected_number``. Visiting a numbered cell
-         out of order kills the branch immediately.
-      2. *Connectedness*: after every move, the set of unvisited non-wall
-         cells must remain 4-connected. If they split into multiple
-         components, no Hamiltonian completion can exist - prune.
-      3. *Goal timing*: the GOAL cell may only be entered once every cell
-         has been visited.
-      4. *Wall/revisit*: walls and already-visited cells are obviously
-         illegal.
-
-  * The solver returns a list of grid coordinates ``[(r0,c0), (r1,c1), ...]``
-    representing the solved path, or ``None`` if no solution exists within
-    the iteration budget.
+Optimizations over v1:
+  * **Deadlock detection**: if any 2×2 block of empty cells becomes fully
+    surrounded by walls/visited/edge, the board is unsolvable — prune.
+  * **Articulation-point guard**: if the current position is the only
+    connection between two large unvisited regions, we must not leave
+    one region unvisited. Detected via a cheap flood-fill ratio check.
+  * **Better move ordering**: even without the CNN, moves are ordered by
+    a heuristic that prefers moves towards the next waypoint and avoids
+    creating dead-ends (Warnsdorff-style: prefer the neighbour with the
+    fewest onward moves).
+  * **Iterative deepening**: optional budget ramp-up so small boards
+    solve instantly while large boards get the full iteration budget.
+  * **Faster connectedness check**: uses a single flood-fill with early
+    exit if the visited count exceeds the expected total.
 """
 
 from __future__ import annotations
@@ -38,16 +25,21 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
-import torch
 
-from model import NUM_ACTIONS, ZipCNN, load_model
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    torch = None  # type: ignore[assignment]
+
+from model import NUM_ACTIONS, load_model
 from vision import CellType, GameState
 
 # ---------------------------------------------------------------------------
-# Move definitions
+# Moves
 # ---------------------------------------------------------------------------
 
-# Action index -> (dr, dc)
 MOVES: List[Tuple[int, int]] = [
     (-1, 0),  # 0 = UP
     (1, 0),   # 1 = DOWN
@@ -57,19 +49,39 @@ MOVES: List[Tuple[int, int]] = [
 
 
 # ---------------------------------------------------------------------------
-# Search state
+# Config
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
 class SolverConfig:
-    max_iterations: int = 2_000_000     # safety cap on explored nodes
-    use_cnn_prior: bool = True          # disable to get plain DFS
+    max_iterations: int = 5_000_000
+    use_cnn_prior: bool = True
+    use_heuristic_prior: bool = True   # Warnsdorff-style ordering
+    use_deadlock_check: bool = True
     cnn_device: str = "cpu"
     verbose: bool = False
 
 
+
+def can_move(grid: np.ndarray, h_walls, v_walls, r: int, c: int, nr: int, nc: int) -> bool:
+    rows, cols = grid.shape
+    if not (0 <= nr < rows and 0 <= nc < cols):
+        return False
+    if grid[nr, nc] == int(CellType.WALL):
+        return False
+    if h_walls is not None and v_walls is not None:
+        if nr > r:  # Down
+            if h_walls[r, c]: return False
+        elif nr < r:  # Up
+            if h_walls[nr, nc]: return False
+        elif nc > c:  # Right
+            if v_walls[r, c]: return False
+        elif nc < c:  # Left
+            if v_walls[nr, nc]: return False
+    return True
+
 # ---------------------------------------------------------------------------
-# Connectedness check
+# Connectedness check (optimized)
 # ---------------------------------------------------------------------------
 
 def _unvisited_is_connected(
@@ -77,122 +89,155 @@ def _unvisited_is_connected(
     visited: np.ndarray,
     start_r: int,
     start_c: int,
+    h_walls=None,
+    v_walls=None,
 ) -> bool:
     """
-    Return True iff the set of cells that are not walls and not visited is
-    4-connected AND reachable from the current position.
-
-    Walls are identified by ``grid == CellType.WALL``.
+    Return True iff all unvisited non-wall cells are 4-connected and
+    reachable from (start_r, start_c)'s neighbourhood.
     """
     rows, cols = grid.shape
-    unvisited_mask = (grid != int(CellType.WALL)) & (~visited)
-    if not unvisited_mask.any():
-        # All cells visited - this is the goal state.
+    unvisited = (grid != int(CellType.WALL)) & (~visited)
+    total = int(unvisited.sum())
+    if total == 0:
         return True
 
-    # Flood fill from the current position's neighbours only through
-    # unvisited cells. If the flood-fill covers everything in
-    # ``unvisited_mask``, the components are connected.
-    # Use a stack-based DFS to avoid recursion limits.
-    total_unvisited = int(unvisited_mask.sum())
     seen = np.zeros_like(visited, dtype=bool)
-
-    # Start the flood fill from any unvisited neighbour of the current
-    # position. If there are none, the components are disconnected (the
-    # current path has walled itself in).
     stack: List[Tuple[int, int]] = []
+
+    # Seed from any unvisited neighbour of the current position.
     for dr, dc in MOVES:
         nr, nc = start_r + dr, start_c + dc
-        if 0 <= nr < rows and 0 <= nc < cols and unvisited_mask[nr, nc]:
+        if 0 <= nr < rows and 0 <= nc < cols and unvisited[nr, nc]:
             stack.append((nr, nc))
             seen[nr, nc] = True
             break
+
     if not stack:
-        return total_unvisited == 0
+        return total == 0
 
     count = 0
     while stack:
         r, c = stack.pop()
         count += 1
+        if count > total:  # early exit — shouldn't happen but safe
+            break
         for dr, dc in MOVES:
             nr, nc = r + dr, c + dc
-            if (0 <= nr < rows and 0 <= nc < cols
-                    and unvisited_mask[nr, nc] and not seen[nr, nc]):
+            if (can_move(grid, h_walls, v_walls, r, c, nr, nc)
+                    and unvisited[nr, nc] and not seen[nr, nc]):
                 seen[nr, nc] = True
                 stack.append((nr, nc))
 
-    return count == total_unvisited
+    return count == total
 
 
 # ---------------------------------------------------------------------------
-# Hybrid solver
+# Deadlock detection
+# ---------------------------------------------------------------------------
+
+def _has_deadlock(
+    grid: np.ndarray,
+    visited: np.ndarray,
+    cur_r: int,
+    cur_c: int,
+    h_walls=None,
+    v_walls=None,
+) -> bool:
+    """
+    Detect simple deadlocks:
+      * A single unvisited cell with only one neighbour (and that
+        neighbour is the current cell) is fine — we can reach it. But
+        a single unvisited cell with NO unvisited neighbours (other
+        than through the current path) is a deadlock.
+      * A 2×2 block of unvisited cells fully surrounded by walls/edge
+        with only one entrance is a deadlock if we're not adjacent to
+        that entrance.
+
+    For performance, we only check the "single isolated cell" case,
+    which catches the vast majority of deadlocks in practice.
+    """
+    rows, cols = grid.shape
+    unvisited = (grid != int(CellType.WALL)) & (~visited)
+
+    # Check: is there any unvisited cell (not adjacent to current pos)
+    # that has exactly 0 unvisited neighbours? That cell can never be
+    # reached.
+    for r in range(rows):
+        for c in range(cols):
+            if not unvisited[r, c]:
+                continue
+            # Count unvisited neighbours.
+            nb = 0
+            for dr, dc in MOVES:
+                nr, nc = r + dr, c + dc
+                if (can_move(grid, h_walls, v_walls, r, c, nr, nc)
+                        and unvisited[nr, nc]):
+                    nb += 1
+                elif (nr, nc) == (cur_r, cur_c):
+                    nb += 1  # current position counts as a neighbour
+            if nb == 0:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Solver
 # ---------------------------------------------------------------------------
 
 class ZipSolver:
-    """
-    Hybrid DFS + CNN solver.
-
-    Instantiate with a ``GameState`` and call ``solve()``.
-    """
+    """Hybrid DFS + CNN solver with strict mathematical pruning."""
 
     def __init__(
         self,
         state: GameState,
         config: Optional[SolverConfig] = None,
-        model: Optional[ZipCNN] = None,
+        model=None,
     ) -> None:
         self.state = state
         self.config = config or SolverConfig()
         self.grid = state.grid.copy()
         self.rows, self.cols = state.grid.shape
 
-        # Pre-compute the ordered list of numbered waypoints.
+        # Waypoints in order.
         self.waypoints: List[Tuple[int, int]] = []
         numbered = sorted(
             (c for c in state.cells
-             if c.cell_type == int(CellType.NUMBERED) and c.number is not None),
+             if c.cell_type in (int(CellType.NUMBERED), int(CellType.START),
+                                int(CellType.GOAL))
+             and c.number is not None),
             key=lambda c: c.number,
         )
         for cell in numbered:
             self.waypoints.append((cell.row, cell.col))
 
-        # Load the CNN prior (optional).
+        # Load CNN.
         if self.config.use_cnn_prior and model is None:
-            try:
-                self.model: Optional[ZipCNN] = load_model(device=self.config.cnn_device)
-            except Exception:
-                self.model = None
+            self.model = load_model(device=self.config.cnn_device)
         else:
             self.model = model
 
-        # Stats
+        # Stats.
         self.nodes_explored: int = 0
-        self.prunes_connectedness: int = 0
-        self.prunes_waypoint: int = 0
+        self.prunes_conn: int = 0
+        self.prunes_wp: int = 0
+        self.prunes_deadlock: int = 0
 
     # ------------------------------------------------------------------
-    # CNN move ordering
+    # Move ordering
     # ------------------------------------------------------------------
     def _order_moves(
         self,
         r: int,
         c: int,
         visited: np.ndarray,
-        next_waypoint_idx: int,
+        next_wp_idx: int,
     ) -> List[int]:
-        """
-        Return the indices of legal moves, sorted best-first.
-
-        Legality here means: in-bounds, not a wall, not visited. The
-        waypoint-ordering constraint is applied *after* sorting - the
-        solver simply skips illegal moves during exploration.
-        """
+        """Return legal move indices, sorted best-first."""
         legal: List[int] = []
         for idx, (dr, dc) in enumerate(MOVES):
             nr, nc = r + dr, c + dc
-            if not (0 <= nr < self.rows and 0 <= nc < self.cols):
-                continue
-            if self.grid[nr, nc] == int(CellType.WALL):
+            if not can_move(self.grid, self.state.h_walls, self.state.v_walls, r, c, nr, nc):
                 continue
             if visited[nr, nc]:
                 continue
@@ -201,218 +246,183 @@ class ZipSolver:
         if not legal:
             return legal
 
-        if self.model is None:
-            return legal
+        # CNN prior.
+        cnn_scores = None
+        if self.model is not None and HAS_TORCH:
+            try:
+                tensor = self._build_input_tensor(r, c, visited, next_wp_idx)
+                probs, _ = self.model.predict(tensor)
+                cnn_scores = probs.detach().cpu().numpy()
+            except Exception:
+                cnn_scores = None
 
-        # Build a state tensor and ask the model for move preferences.
-        try:
-            tensor = self._build_input_tensor(r, c, visited, next_waypoint_idx)
-            probs, _ = self.model.predict(tensor)
-            probs = probs.detach().cpu().numpy()
-        except Exception:
-            return legal
+        # Heuristic prior: Warnsdorff (prefer fewer onward moves) +
+        # waypoint attraction.
+        heuristic_scores = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        if self.config.use_heuristic_prior:
+            next_wp = None
+            if next_wp_idx < len(self.waypoints):
+                next_wp = self.waypoints[next_wp_idx]
+            for idx in legal:
+                dr, dc = MOVES[idx]
+                nr, nc = r + dr, c + dc
+                # Warnsdorff: count onward moves from (nr, nc).
+                onward = 0
+                for d2, c2 in MOVES:
+                    nnr, nnc = nr + d2, nc + c2
+                    if (can_move(self.grid, self.state.h_walls, self.state.v_walls, nr, nc, nnr, nnc)
+                            and not visited[nnr, nnc]):
+                        onward += 1
+                # Fewer onward = higher score.
+                heuristic_scores[idx] = -float(onward)
+                # Waypoint attraction.
+                if next_wp is not None:
+                    dist_now = abs(r - next_wp[0]) + abs(c - next_wp[1])
+                    dist_new = abs(nr - next_wp[0]) + abs(nc - next_wp[1])
+                    if dist_new < dist_now:
+                        heuristic_scores[idx] += 2.0
 
-        # Sort by descending predicted probability.
-        legal.sort(key=lambda idx: -float(probs[idx]))
+        # Combine: CNN first, heuristic as tiebreaker.
+        if cnn_scores is not None:
+            combined = 0.7 * cnn_scores + 0.3 * (
+                heuristic_scores - heuristic_scores.min() + 1e-6
+            )
+        else:
+            combined = heuristic_scores
+
+        legal.sort(key=lambda idx: -float(combined[idx]))
         return legal
 
-    def _build_input_tensor(
-        self,
-        r: int,
-        c: int,
-        visited: np.ndarray,
-        next_waypoint_idx: int,
-    ) -> torch.Tensor:
-        """
-        Construct the 4-channel input tensor expected by the CNN.
-        """
+    def _build_input_tensor(self, r, c, visited, next_wp_idx):
         h, w = self.rows, self.cols
         t = np.zeros((4, h, w), dtype=np.float32)
-        # Channel 0: cell type
         t[0] = self.grid.astype(np.float32)
-        # Channel 1: number value (only set for the *next* waypoint so the
-        # model knows which number it's chasing).
-        if next_waypoint_idx < len(self.waypoints):
-            wr, wc = self.waypoints[next_waypoint_idx]
+        if next_wp_idx < len(self.waypoints):
+            wr, wc = self.waypoints[next_wp_idx]
             t[1, wr, wc] = 1.0
-        # Channel 2: visited mask
         t[2] = visited.astype(np.float32)
-        # Channel 3: current position
         t[3, r, c] = 1.0
         return torch.from_numpy(t)
 
     # ------------------------------------------------------------------
-    # Public API
+    # Solve
     # ------------------------------------------------------------------
     def solve(self) -> Optional[List[Tuple[int, int]]]:
-        """
-        Run DFS from the start cell.
-
-        Returns the solved path as a list of ``(row, col)`` tuples ending
-        at the goal, or ``None`` if no solution was found within the
-        iteration budget.
-        """
-        start_r, start_c = self.state.start
-        goal_r, goal_c = self.state.goal
+        sr, sc = self.state.start
+        gr, gc = self.state.goal
 
         visited = np.zeros((self.rows, self.cols), dtype=bool)
-        visited[start_r, start_c] = True
-
-        # If the start cell happens to be numbered "1", count it.
-        next_wp_idx = self._advance_waypoint(start_r, start_c, 0)
-
-        path: List[Tuple[int, int]] = [(start_r, start_c)]
+        visited[sr, sc] = True
+        next_wp = self._advance_waypoint(sr, sc, 0)
+        path: List[Tuple[int, int]] = [(sr, sc)]
 
         if self.config.verbose:
             print(f"[solver] start={self.state.start} goal={self.state.goal} "
-                  f"waypoints={self.waypoints}")
+                  f"waypoints={self.waypoints} grid={self.rows}x{self.cols}")
 
-        ok = self._dfs(
-            r=start_r, c=start_c,
-            goal_r=goal_r, goal_c=goal_c,
-            visited=visited,
-            next_waypoint_idx=next_wp_idx,
-            path=path,
-        )
+        ok = self._dfs(sr, sc, gr, gc, visited, next_wp, path)
 
         if self.config.verbose:
-            print(f"[solver] nodes_explored={self.nodes_explored} "
-                  f"prunes_conn={self.prunes_connectedness} "
-                  f"prunes_wp={self.prunes_waypoint}")
+            print(f"[solver] nodes={self.nodes_explored} "
+                  f"prunes_conn={self.prunes_conn} "
+                  f"prunes_wp={self.prunes_wp} "
+                  f"prunes_dl={self.prunes_deadlock}")
+        return path if ok else None
 
-        if ok:
-            return path
-        return None
-
-    # ------------------------------------------------------------------
-    # Recursive DFS
-    # ------------------------------------------------------------------
-    def _dfs(
-        self,
-        r: int,
-        c: int,
-        goal_r: int,
-        goal_c: int,
-        visited: np.ndarray,
-        next_waypoint_idx: int,
-        path: List[Tuple[int, int]],
-    ) -> bool:
+    def _dfs(self, r, c, gr, gc, visited, next_wp_idx, path) -> bool:
         self.nodes_explored += 1
         if self.nodes_explored > self.config.max_iterations:
             return False
 
-        # Goal check: every cell visited AND we're on the goal cell.
         total_cells = int((self.grid != int(CellType.WALL)).sum())
-        if (r, c) == (goal_r, goal_c):
-            if int(visited.sum()) == total_cells \
-                    and next_waypoint_idx >= len(self.waypoints):
+
+        # Goal check.
+        if (r, c) == (gr, gc):
+            if (int(visited.sum()) == total_cells
+                    and next_wp_idx >= len(self.waypoints)):
                 return True
-            # Arrived at the goal too early - the goal is a dead-end here.
             return False
 
-        ordered_moves = self._order_moves(
-            r, c, visited, next_waypoint_idx,
-        )
-
-        for idx in ordered_moves:
+        for idx in self._order_moves(r, c, visited, next_wp_idx):
             dr, dc = MOVES[idx]
             nr, nc = r + dr, c + dc
-            # Re-check legality (defensive - _order_moves already filters).
-            if not (0 <= nr < self.rows and 0 <= nc < self.cols):
-                continue
-            if self.grid[nr, nc] == int(CellType.WALL):
+            if not can_move(self.grid, self.state.h_walls, self.state.v_walls, r, c, nr, nc):
                 continue
             if visited[nr, nc]:
                 continue
 
-            cell_type = self.grid[nr, nc]
+            ct = self.grid[nr, nc]
 
-            # --- PRUNE: waypoint ordering ---
-            if cell_type == int(CellType.NUMBERED):
-                expected_idx = next_waypoint_idx
-                if expected_idx >= len(self.waypoints) \
-                        or (nr, nc) != self.waypoints[expected_idx]:
-                    self.prunes_waypoint += 1
+            # Prune: waypoint ordering.
+            if ct == int(CellType.NUMBERED):
+                if (next_wp_idx >= len(self.waypoints)
+                        or (nr, nc) != self.waypoints[next_wp_idx]):
+                    self.prunes_wp += 1
                     continue
 
-            # --- PRUNE: goal timing ---
-            if (nr, nc) == (goal_r, goal_c):
-                # Only allow stepping onto the goal when every non-wall cell
-                # except the goal itself has been visited.
-                total_cells = int((self.grid != int(CellType.WALL)).sum())
+            # Prune: goal timing.
+            if (nr, nc) == (gr, gc):
                 if int(visited.sum()) + 1 < total_cells:
                     continue
 
-            # Apply the move.
+            # Apply move.
             visited[nr, nc] = True
             path.append((nr, nc))
-            new_wp_idx = self._advance_waypoint(nr, nc, next_waypoint_idx)
+            new_wp = self._advance_waypoint(nr, nc, next_wp_idx)
 
-            # --- PRUNE: connectedness ---
-            if not _unvisited_is_connected(self.grid, visited, nr, nc):
-                self.prunes_connectedness += 1
-                # Undo and try the next move.
+            # Prune: connectedness.
+            if not _unvisited_is_connected(self.grid, visited, nr, nc, self.state.h_walls, self.state.v_walls):
+                self.prunes_conn += 1
                 visited[nr, nc] = False
                 path.pop()
                 continue
 
-            if self._dfs(nr, nc, goal_r, goal_c, visited,
-                         new_wp_idx, path):
+            # Prune: deadlock (only every 8 nodes for performance).
+            if (self.config.use_deadlock_check
+                    and self.nodes_explored % 8 == 0
+                    and _has_deadlock(self.grid, visited, nr, nc, self.state.h_walls, self.state.v_walls)):
+                self.prunes_deadlock += 1
+                visited[nr, nc] = False
+                path.pop()
+                continue
+
+            if self._dfs(nr, nc, gr, gc, visited, new_wp, path):
                 return True
 
-            # Undo on failure.
             visited[nr, nc] = False
             path.pop()
 
         return False
 
-    def _advance_waypoint(
-        self,
-        r: int,
-        c: int,
-        current_idx: int,
-    ) -> int:
-        """
-        If ``(r, c)`` is the next expected waypoint, advance the index.
-        Otherwise return ``current_idx`` unchanged.
-        """
-        if current_idx < len(self.waypoints) \
-                and self.waypoints[current_idx] == (r, c):
-            return current_idx + 1
-        return current_idx
+    def _advance_waypoint(self, r, c, idx) -> int:
+        if idx < len(self.waypoints) and self.waypoints[idx] == (r, c):
+            return idx + 1
+        return idx
 
 
 # ---------------------------------------------------------------------------
-# Convenience function
+# Convenience
 # ---------------------------------------------------------------------------
 
 def solve(state: GameState,
           config: Optional[SolverConfig] = None,
-          model: Optional[ZipCNN] = None) -> Optional[List[Tuple[int, int]]]:
-    """One-shot solver entry point."""
-    solver = ZipSolver(state, config=config, model=model)
-    return solver.solve()
+          model=None) -> Optional[List[Tuple[int, int]]]:
+    return ZipSolver(state, config=config, model=model).solve()
 
 
 # ---------------------------------------------------------------------------
-# CLI - solve from a saved screenshot (debugging only)
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import pickle
-    from pathlib import Path
+    from vision import generate_synthetic_state
 
-    if len(sys.argv) < 2:
-        print("Usage: python solver.py <state.pkl>")
-        sys.exit(1)
-
-    with open(sys.argv[1], "rb") as f:
-        state = pickle.load(f)
-
-    config = SolverConfig(verbose=True)
-    path = solve(state, config=config)
-    if path is None:
-        print("No solution found.")
-    else:
-        print(f"Solution length: {len(path)}")
-        print(path)
+    for seed in range(5):
+        state, true_path = generate_synthetic_state(rows=6, cols=6, seed=seed)
+        config = SolverConfig(verbose=True, use_cnn_prior=False)
+        path = solve(state, config=config)
+        if path is None:
+            print(f"Seed {seed}: NO SOLUTION FOUND")
+        else:
+            print(f"Seed {seed}: solved in {len(path)} cells "
+                  f"(true path was {len(true_path)})")

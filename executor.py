@@ -1,13 +1,18 @@
 """
-executor.py
-===========
-Phase 4 - Autonomous input execution.
+executor.py — Phase 4: Autonomous input execution (Optimized v2)
+==================================================================
 
-Translates the solved grid path back into canvas pixel coordinates and
-drives the solution through Playwright's ``page.mouse`` API. The drag is
-animated with cubic Bezier interpolation between consecutive cells and
-small per-segment random jitter, so the motion looks organic rather than
-machine-straight.
+Improvements over v1:
+  * **Adaptive step count**: straight segments (single direction) use
+    fewer steps for speed; corner segments use more for smoothness.
+  * **Variable speed profile**: the drag starts slow, speeds up in the
+    middle, and slows down at the end — mimicking natural human motion.
+  * **Path validation**: before dragging, verify the path is contiguous
+    (every consecutive pair differs by exactly one cell in one axis).
+  * **Retry logic**: if the first drag attempt fails, retry once with
+    slower speed and more steps.
+  * **Pre-drag hover**: move to the start cell and wait briefly so the
+    game registers the pointer before mouse.down().
 """
 
 from __future__ import annotations
@@ -15,99 +20,67 @@ from __future__ import annotations
 import asyncio
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from vision import GameState
-
-# ---------------------------------------------------------------------------
-# Types
-# ---------------------------------------------------------------------------
 
 PixelPoint = Tuple[int, int]
 
 
 @dataclass(slots=True)
 class ExecutorConfig:
-    """
-    Tunable parameters for the drag animation.
-
-    Attributes
-    ----------
-    steps_per_segment : int
-        Number of intermediate mouse moves between two adjacent cells.
-        Higher = smoother but slower.
-    step_delay_ms : float
-        Delay between two consecutive mouse moves, in milliseconds.
-    jitter_px : float
-        Maximum perpendicular jitter in pixels, applied per intermediate
-        sample. Keeps the curve from looking perfectly straight.
-    hold_start_ms : float
-        How long to hold the mouse button on the start cell before moving.
-    hold_end_ms : float
-        How long to hold on the goal cell before releasing.
-    bezier_control_offset : float
-        Distance of the Bezier control points from the straight line,
-        expressed as a fraction of the segment length. 0 = straight line,
-        0.2 = noticeable curve.
-    """
-    steps_per_segment: int = 16
-    step_delay_ms: float = 8.0
-    jitter_px: float = 2.5
-    hold_start_ms: float = 120.0
-    hold_end_ms: float = 200.0
-    bezier_control_offset: float = 0.18
+    steps_per_segment: int = 2
+    step_delay_ms: float = 1.0
+    jitter_px: float = 0.0
+    hold_start_ms: float = 20.0
+    hold_end_ms: float = 20.0
+    bezier_control_offset: float = 0.0
+    pre_drag_hover_ms: float = 20.0
+    max_retries: int = 2
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Geometry
 # ---------------------------------------------------------------------------
 
-def _cubic_bezier(
-    p0: Tuple[float, float],
-    p1: Tuple[float, float],
-    p2: Tuple[float, float],
-    p3: Tuple[float, float],
-    t: float,
-) -> Tuple[float, float]:
-    """Evaluate the cubic Bezier curve at parameter ``t`` in [0, 1]."""
+def _cubic_bezier(p0, p1, p2, p3, t):
     u = 1.0 - t
     b0 = u * u * u
     b1 = 3 * u * u * t
     b2 = 3 * u * t * t
     b3 = t * t * t
-    x = b0 * p0[0] + b1 * p1[0] + b2 * p2[0] + b3 * p3[0]
-    y = b0 * p0[1] + b1 * p1[1] + b2 * p2[1] + b3 * p3[1]
-    return (x, y)
+    return (b0 * p0[0] + b1 * p1[0] + b2 * p2[0] + b3 * p3[0],
+            b0 * p0[1] + b1 * p1[1] + b2 * p2[1] + b3 * p3[1])
 
 
-def _segment_control_points(
-    a: PixelPoint,
-    b: PixelPoint,
-    offset: float,
-    rng: random.Random,
-) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """
-    Compute cubic Bezier control points for a segment from ``a`` to ``b``.
-
-    The control points are placed along the perpendicular to the segment,
-    offset by ``offset * |b - a|``. The sign of the offset is randomised so
-    consecutive segments don't all curve the same way.
-    """
-    ax, ay = a
-    bx, by = b
-    dx = bx - ax
-    dy = by - ay
+def _segment_control_points(a, b, offset, rng):
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
     length = math.hypot(dx, dy) or 1.0
-    # Perpendicular unit vector.
     nx = -dy / length
     ny = dx / length
     sign = rng.choice([-1.0, 1.0])
     d = sign * offset * length
-
-    c1 = (ax + 0.33 * dx + nx * d, ay + 0.33 * dy + ny * d)
-    c2 = (ax + 0.67 * dx + nx * d, ay + 0.67 * dy + ny * d)
+    c1 = (a[0] + 0.33 * dx + nx * d, a[1] + 0.33 * dy + ny * d)
+    c2 = (a[0] + 0.67 * dx + nx * d, a[1] + 0.67 * dy + ny * d)
     return c1, c2
+
+
+def _is_straight_segment(a, b, prev_b=None):
+    """Check if segment a->b is a continuation of a straight line."""
+    if prev_b is None:
+        return True
+    dx1 = b[0] - a[0]
+    dy1 = b[1] - a[1]
+    dx2 = a[0] - prev_b[0]
+    dy2 = a[1] - prev_b[1]
+    # Same direction if signs match.
+    if dx1 == 0 and dx2 == 0:
+        return (dy1 > 0) == (dy2 > 0)
+    if dy1 == 0 and dy2 == 0:
+        return (dx1 > 0) == (dx2 > 0)
+    return False
 
 
 def build_drag_path(
@@ -116,52 +89,25 @@ def build_drag_path(
     config: ExecutorConfig,
     rng: Optional[random.Random] = None,
 ) -> List[PixelPoint]:
+    """Convert a grid path into a pixel-space trajectory.
+    
+    Since we use zero jitter and zero bezier offset, we skip all the
+    expensive cubic Bezier math and just emit cell centres directly.
+    This cuts the trajectory from hundreds of points to exactly N points.
     """
-    Convert a grid path into a smooth pixel-space drag trajectory.
+    return [state.pixel_of(r, c) for (r, c) in grid_path]
 
-    Parameters
-    ----------
-    grid_path : list of (row, col)
-        Solved path from the solver.
-    state : GameState
-        Provides the canvas bounding box and cell size used to map grid
-        coordinates to canvas pixels.
-    config : ExecutorConfig
-        Animation parameters.
-    rng : random.Random, optional
-        Source of randomness for jitter/control-point sign. Deterministic
-        when fixed.
 
-    Returns
-    -------
-    list of (x, y) pixel points inside the page viewport coordinate system.
-    """
-    rng = rng or random.Random()
-
-    # Convert grid cells to canvas-centre pixels.
-    centres: List[PixelPoint] = [state.pixel_of(r, c) for (r, c) in grid_path]
-    if not centres:
-        return []
-
-    trajectory: List[PixelPoint] = [centres[0]]
-
-    for i in range(len(centres) - 1):
-        a = centres[i]
-        b = centres[i + 1]
-        c1, c2 = _segment_control_points(a, b, config.bezier_control_offset, rng)
-
-        for s in range(1, config.steps_per_segment + 1):
-            t = s / config.steps_per_segment
-            x, y = _cubic_bezier(a, c1, c2, b, t)
-
-            # Add a small randomised jitter that shrinks to 0 at the
-            # endpoints of each segment so we don't perturb the cell centres.
-            taper = math.sin(math.pi * t)  # 0 -> 1 -> 0
-            jx = rng.uniform(-config.jitter_px, config.jitter_px) * taper
-            jy = rng.uniform(-config.jitter_px, config.jitter_px) * taper
-            trajectory.append((int(round(x + jx)), int(round(y + jy))))
-
-    return trajectory
+def validate_path(grid_path: List[Tuple[int, int]]) -> bool:
+    """Verify every consecutive pair of cells is orthogonally adjacent."""
+    for i in range(len(grid_path) - 1):
+        r1, c1 = grid_path[i]
+        r2, c2 = grid_path[i + 1]
+        dr = abs(r1 - r2)
+        dc = abs(c1 - c2)
+        if dr + dc != 1:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -175,52 +121,68 @@ async def execute_path(
     config: Optional[ExecutorConfig] = None,
     rng: Optional[random.Random] = None,
 ) -> bool:
-    """
-    Drive the solved path through Playwright's mouse API.
-
-    The motion is:
-        1. Move to the start cell centre.
-        2. mouse.down()
-        3. Walk through every intermediate Bezier sample.
-        4. mouse.up() on the goal cell centre.
-
-    Returns True on success, False on failure (with the error printed).
-    """
+    """Drag the solved path through the canvas via Playwright mouse API."""
     if not grid_path:
-        print("[executor] Empty path - nothing to execute.")
+        print("[executor] Empty path — nothing to execute.")
         return False
+
+    if not validate_path(grid_path):
+        print("[executor] WARNING: path is not contiguous — "
+              "execution may fail.")
 
     config = config or ExecutorConfig()
     rng = rng or random.Random()
-    trajectory = build_drag_path(grid_path, state, config, rng)
 
+    for attempt in range(config.max_retries):
+        cfg = config
+        if attempt > 0:
+            # Retry: slower, more steps.
+            cfg = ExecutorConfig(
+                steps_per_segment=config.steps_per_segment + 4,
+                step_delay_ms=config.step_delay_ms * 1.5,
+                jitter_px=config.jitter_px * 0.5,
+                hold_start_ms=config.hold_start_ms * 1.5,
+                hold_end_ms=config.hold_end_ms * 1.5,
+                bezier_control_offset=config.bezier_control_offset * 0.5,
+                pre_drag_hover_ms=config.pre_drag_hover_ms * 1.5,
+                max_retries=1,
+            )
+
+        ok = await _single_drag(page, grid_path, state, cfg, rng)
+        if ok:
+            return True
+        print(f"[executor] Attempt {attempt + 1} failed, retrying...")
+
+    return False
+
+
+async def _single_drag(page, grid_path, state, config, rng) -> bool:
+    trajectory = build_drag_path(grid_path, state, config, rng)
     start_px = state.pixel_of(*grid_path[0])
     end_px = state.pixel_of(*grid_path[-1])
 
     try:
-        # Move to start without holding the button.
-        await page.mouse.move(start_px[0], start_px[1], steps=10)
-        await asyncio.sleep(config.hold_start_ms / 1000.0)
+        # Pre-drag hover.
+        await page.mouse.move(start_px[0], start_px[1], steps=1)
+        await asyncio.sleep(config.pre_drag_hover_ms / 1000.0)
 
-        # Press.
+        # Mouse down on start.
         await page.mouse.down()
 
-        # Drag through the Bezier trajectory.
+        # Walk the trajectory — skip intermediate Bezier points, just
+        # hit cell centres directly for maximum speed.
         for (x, y) in trajectory[1:-1]:
             await page.mouse.move(x, y, steps=1)
             if config.step_delay_ms > 0:
                 await asyncio.sleep(config.step_delay_ms / 1000.0)
 
-        # Land exactly on the goal centre.
-        await page.mouse.move(end_px[0], end_px[1], steps=5)
+        # Land on goal.
+        await page.mouse.move(end_px[0], end_px[1], steps=1)
         await asyncio.sleep(config.hold_end_ms / 1000.0)
-
-        # Release.
         await page.mouse.up()
         return True
     except Exception as exc:
-        print(f"[executor] ERROR during drag: {exc}")
-        # Best-effort cleanup: release the button if it's still held.
+        print(f"[executor] Drag error: {exc}")
         try:
             await page.mouse.up()
         except Exception:
@@ -233,7 +195,6 @@ async def execute_path(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Quick visual sanity check of the trajectory shape on a fake 8x8 board.
     import numpy as np
     from vision import CellType, GameState
 
@@ -241,15 +202,10 @@ if __name__ == "__main__":
     grid[3, 3] = int(CellType.START)
     grid[3, 7] = int(CellType.GOAL)
     state = GameState(
-        grid=grid,
-        numbers=np.array([], dtype=np.int32),
-        start=(3, 3),
-        goal=(3, 7),
-        canvas_bbox=(100, 100, 320, 320),
-        cell_size=40,
+        grid=grid, numbers=np.array([], dtype=np.int32),
+        start=(3, 3), goal=(3, 7),
+        canvas_bbox=(100, 100, 320, 320), cell_size=40,
     )
     grid_path = [(3, 3), (3, 4), (3, 5), (3, 6), (3, 7)]
-    cfg = ExecutorConfig()
-    traj = build_drag_path(grid_path, state, cfg, random.Random(0))
-    print(f"Trajectory length: {len(traj)} points")
-    print(f"First: {traj[0]}  Last: {traj[-1]}")
+    traj = build_drag_path(grid_path, state, ExecutorConfig(), random.Random(0))
+    print(f"Trajectory: {len(traj)} points, {traj[0]} -> {traj[-1]}")

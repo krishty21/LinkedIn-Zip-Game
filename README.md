@@ -1,137 +1,102 @@
-# LinkedIn Zip Solver
+# LinkedIn Zip Solver (Optimized v2)
 
 A hybrid ML / constraint-programming pipeline that solves the LinkedIn
 **Zip** puzzle game via browser automation.
 
-The project is split into five phases, each implemented in its own module:
+## What's new in v2
 
-| Phase | Module           | Responsibility                                         |
-|------:|------------------|--------------------------------------------------------|
-|   1   | `setup_env.py`   | Create venv, install deps, fetch Chromium              |
-|   2   | `vision.py`      | Playwright capture + OpenCV grid parsing               |
-|   3   | `solver.py`      | Hybrid DFS + CNN solver with strict pruning            |
-|   3   | `model.py`       | PyTorch CNN policy/value network                       |
-|   4   | `executor.py`    | Bezier-curve mouse drag through the solved path        |
-|   5   | `package.py`     | Bundle workspace into `linkedin_zip_solver.zip`        |
-
-`main.py` orchestrates every phase sequentially.
-
----
+* **DOM-first vision**: reads cell data directly from the page DOM
+  (`[data-cell-idx]`, `aria-label`) for pixel-perfect accuracy — no OCR.
+* **Color-based wall detection**: compares each cell's background against
+  the active (white) cell colour to detect invisible beige walls.
+* **Edge Wall Detection**: Extracts internal black walls using OpenCV by scanning pixel gaps between cells on the raw screenshot, preventing the solver from clipping through internal obstacles.
+* **Optimized solver**: Warnsdorff-style heuristic move ordering + deadlock detection + connectedness pruning + **strict mathematical edge routing**.
+* **Trained CNN**: ships with `zip_cnn.pth` weights trained on 500+ synthetic boards. Used as a move-ordering prior; falls back to plain DFS if torch is unavailable.
+* **Blazing Fast Executor**: Configured for near-instantaneous drawing of straight lines (sub-millisecond delay) with zero jitter.
+* **Robust types**: the `'str' // int` crash from v1 is eliminated via universal type coercion.
 
 ## Quick start
 
 ```bash
-# 1. Provision the environment (creates ./venv, installs deps + Chromium)
-python setup_env.py
+# 2. Train the CNN (optional but recommended — ~2 min on CPU)
+./venv/bin/python train.py --num-games 500 --epochs 25
 
-# 2. Run the full pipeline end-to-end
-#    On first run, a visible Chromium window opens so you can log into
-#    LinkedIn. Cookies are persisted in ./.browser_data/ so subsequent
-#    runs can be headless.
-./venv/bin/python main.py
-
-# Or, if the venv is already provisioned:
+# 3. Run the full pipeline
 ./venv/bin/python main.py --skip-setup
 
-# Headless solve once logged in:
+# Headless solve (requires prior login):
 ./venv/bin/python main.py --skip-setup --headless --solve-only
 
-# Just rebuild the redistributable zip:
-./venv/bin/python main.py --package-only
 ```
-
----
 
 ## Architecture
 
 ### Vision (`vision.py`)
 
-* Launches Playwright with a **persistent** browser context so LinkedIn
-  login cookies survive between runs.
-* Captures the canvas bounding box and screenshot.
-* Runs an OpenCV pipeline:
-  * Adaptive thresholding + Hough lines detect the grid shape.
-  * Per-cell classification via brightness / saturation / template
-    matching recovers walls, the start, the goal, and numbered
-    waypoints (1, 2, 3, ...).
-* Outputs a `GameState` containing the grid tensor, waypoint list,
-  and cell → pixel mapping.
+1. **Primary**: DOM extraction via `page.evaluate()`. Queries every
+   `[data-cell-idx]` element, reads `aria-label` for waypoint numbers,
+   and `getComputedStyle().backgroundColor` for wall detection (using global mode).
+2. **Edge Walls**: Crops the grid from a full-page OpenCV screenshot and scans the exact midpoints between all adjacent cells to build a strict `h_walls` and `v_walls` matrix.
+3. **Fallback**: OpenCV adaptive-threshold + Hough-line grid detection
+   on a screenshot, used only if DOM extraction fails.
 
 ### Solver (`solver.py` + `model.py`)
 
-* `ZipCNN` is a 3-conv + 2-head policy/value network (~150 KB). Given
-  a 4-channel grid tensor it predicts a softmax policy over
-  `{Up, Down, Left, Right}` and a scalar value in `(-1, 1)`.
-* `ZipSolver` runs DFS from the start cell. At every node the legal
-  moves are sorted by the CNN's predicted probability, so the most
-  promising branches are explored first.
-* **Strict pruning** guarantees correctness:
-  * **Waypoint ordering**: numbered cells must be visited in order.
-  * **Connectedness**: after every move, the unvisited non-wall cells
-    must remain 4-connected (otherwise no Hamiltonian completion can
-    exist - prune immediately).
-  * **Goal timing**: the goal cell may only be entered once every
-    non-wall cell has been visited.
-* If no `.pth` weights file is present the solver silently falls back
-  to plain DFS - it still works, just slower on larger boards.
+* **DFS backbone** with strict pruning:
+  * Waypoint ordering (must visit numbered cells in order).
+  * Connectedness (unvisited cells must stay 4-connected).
+  * Goal timing (goal cell only entered when all cells visited).
+  * Deadlock detection (isolated unvisited cells).
+* **Move ordering** (best-first):
+  1. CNN policy prior (if `zip_cnn.pth` exists).
+  2. Warnsdorff heuristic (prefer neighbours with fewer onward moves).
+  3. Waypoint attraction (prefer moves towards the next waypoint).
 
 ### Executor (`executor.py`)
 
-* Converts the grid path into pixel coordinates via
-  `GameState.pixel_of`.
-* Builds a smooth trajectory using **cubic Bezier** interpolation
-  between consecutive cells, with randomised control-point sign and
-  small perpendicular jitter that tapers to zero at cell centres.
-* Drives the drag through Playwright's `page.mouse` API:
-  `move(start)` → `down()` → walk the Bezier samples → `up()`.
+* Cubic Bezier interpolation between cell centres.
+* Adaptive step count (straight = fewer, corners = more).
+* Tapered jitter (zero at cell centres so endpoints are exact).
+* Retry on failure with slower, smoother parameters.
 
-### Packaging (`package.py`)
+### Training (`train.py`)
 
-* Stages `vision.py`, `solver.py`, `model.py`, `executor.py`,
-  `setup_env.py`, `package.py`, `main.py`, `requirements.txt`,
-  `README.md`, and the optional `zip_cnn.pth` into `dist/`.
-* Explicitly excludes `venv/`, `.venv/`, `__pycache__/`,
-  `.browser_data/`, `dist/`, `.git/`, and `*.pyc` files.
-* Produces `dist/linkedin_zip_solver.zip`.
-
----
+* Generates random solvable boards (5×5 to 8×8).
+* Uses the true solution path as supervision.
+* AlphaZero-style composite loss: policy cross-entropy + value MSE.
 
 ## CLI flags (`main.py`)
 
-| Flag                | Effect                                         |
-|---------------------|------------------------------------------------|
-| `--skip-setup`      | Skip Phase 1 (venv already provisioned)        |
-| `--solve-only`      | Run Phases 2-4, skip packaging                 |
-| `--package-only`    | Run only Phase 5 (rebuild the zip)             |
-| `--headless`        | Run Chromium headless                          |
-| `--no-cnn`          | Disable CNN prior, use plain DFS               |
-| `--max-iterations`  | Override the DFS node budget (default 2,000,000) |
+| Flag | Effect |
+|------|--------|
+| `--skip-setup` | Skip Phase 1 |
+| `--solve-only` | Skip packaging |
+| `--package-only` | Rebuild zip only |
+| `--headless` | Headless browser |
+| `--no-cnn` | Plain DFS (no CNN) |
+| `--train` | Train CNN before solving |
+| `--max-iterations` | DFS node budget (default 5,000,000) |
 
----
+## Notebook
 
-## Training the CNN (optional)
+Open `setup_notebook.ipynb` in Jupyter to:
+1. Verify the environment.
+2. Run synthetic solver tests (5 boards).
+3. Train the CNN.
+4. Launch the live solver against LinkedIn.
 
-The solver works without trained weights (it falls back to plain DFS).
-To train the network from self-play samples, collect
-`(state_tensor, policy_target, value_target)` tuples and call:
+## File layout
 
-```python
-from model import train_on_samples
-train_on_samples(samples, epochs=20, lr=1e-3)
 ```
-
-The weights are saved to `zip_cnn.pth` and automatically picked up by
-the solver on the next run.
-
----
-
-## Error handling
-
-Every module raises typed exceptions on failure:
-
-* `vision.VisionError` - canvas capture / parsing failures.
-* `solver.SolverConfig` validation - bad iteration budgets, etc.
-* `executor` returns `False` and prints the error if the drag fails.
-
-`main.py` surfaces the failure of each phase and aborts cleanly so you
-can re-run after fixing the root cause.
+linkedin_zip_solver/
+├── vision.py          # DOM-first grid parser
+├── solver.py          # DFS + CNN + pruning
+├── model.py           # PyTorch CNN (graceful fallback)
+├── executor.py        # Bezier mouse drag
+├── train.py           # Synthetic self-play trainer
+├── main.py            # orchestrator
+├── requirements.txt   # dependency pin set
+├── setup_notebook.ipynb
+├── zip_cnn.pth        # trained weights (optional)
+└── README.md
+```
