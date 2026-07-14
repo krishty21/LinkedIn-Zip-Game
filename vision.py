@@ -202,13 +202,16 @@ _DOM_EXTRACTION_JS = r"""
     cells.forEach(c => {
         const idx = parseInt(c.getAttribute('data-cell-idx'), 10);
         const rect = c.getBoundingClientRect();
-        const content = c.querySelector('[data-cell-content="true"]');
+        const content = c.querySelector('[data-cell-content="true"], .trail-cell-content');
         let number = null;
         let ariaLabel = null;
         if (content) {
             ariaLabel = content.getAttribute('aria-label');
             if (ariaLabel) {
                 const n = parseInt(ariaLabel, 10);
+                if (!isNaN(n)) number = n;
+            } else {
+                const n = parseInt(content.textContent.trim(), 10);
                 if (!isNaN(n)) number = n;
             }
         }
