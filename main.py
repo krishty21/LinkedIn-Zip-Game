@@ -6,6 +6,7 @@ Chains: vision → solver → executor.
 
 CLI:
     --headless        Headless browser
+    --guest           Use a temporary browser profile (not logged in, unlimited plays)
     --no-cnn          Plain DFS (no CNN prior)
     --train           Train CNN before solving
     --max-iterations  DFS node budget
@@ -46,10 +47,15 @@ def run_training() -> bool:
         return False
 
 
-async def run_vision(headless: bool):
+async def run_vision(headless: bool, guest: bool = False):
     print("\n=== Vision & state capture ===")
+    context_dir = None
+    if guest:
+        import tempfile
+        context_dir = Path(tempfile.mkdtemp(prefix="zip_guest_"))
+        print("[main] Guest mode — using temporary browser profile.")
     try:
-        page, state = await capture_state(headless=headless)
+        page, state = await capture_state(headless=headless, context_dir=context_dir)
     except VisionError as exc:
         print(f"[main] Vision error: {exc}")
         return None, None
@@ -97,7 +103,7 @@ async def amain(args: argparse.Namespace) -> int:
     if args.train:
         run_training()
 
-    page, state = await run_vision(headless=args.headless)
+    page, state = await run_vision(headless=args.headless, guest=args.guest)
     if state is None:
         print("[main] Vision failed — aborting.")
         return 1
@@ -119,6 +125,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--solve-only", action="store_true",
                    help="(Legacy, kept for compatibility.)")
     p.add_argument("--headless", action="store_true")
+    p.add_argument("--guest", action="store_true",
+                   help="Use a temporary browser profile (not logged in).")
     p.add_argument("--no-cnn", action="store_true")
     p.add_argument("--train", action="store_true",
                    help="Train CNN before solving.")

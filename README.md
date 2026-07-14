@@ -18,8 +18,7 @@ LinkedIn **Zip** puzzle game via browser automation.
   Used for move-ordering; falls back to plain DFS if PyTorch is unavailable.
 * **Blazing-fast executor** — direct cell-to-cell mouse movement with
   sub-millisecond delays. No Bezier interpolation needed.
-* **Dry-run mode** — solve random synthetic boards locally without a browser
-  or LinkedIn login (unlimited retries for testing).
+* **Guest mode** — open a fresh browser without your LinkedIn login to solve the real puzzle with unlimited practice retries.
 
 ## Quick Start
 
@@ -45,9 +44,8 @@ python main.py --solve-only --skip-setup --headless
 
 Open **`setup_notebook.ipynb`** in Jupyter for an interactive experience:
 
-1. Set `LOGGED_IN = True` to solve the **real LinkedIn puzzle** (once per day).
-2. Set `LOGGED_IN = False` to run a **dry-run** on synthetic boards — no
-   browser, no login, unlimited retries.
+1. Set `LOGGED_IN = True` to solve the **real LinkedIn puzzle** using your daily attempt (uses saved cookies).
+2. Set `LOGGED_IN = False` to run in **guest mode** — opens a fresh browser, navigate to the puzzle and solve it without a login for unlimited practice.
 
 ## Architecture
 
@@ -90,6 +88,7 @@ Open **`setup_notebook.ipynb`** in Jupyter for an interactive experience:
 | `--skip-setup` | Skip environment setup phase |
 | `--solve-only` | Skip packaging |
 | `--headless` | Run browser headlessly |
+| `--guest` | Use a temporary browser profile (unlimited plays) |
 | `--no-cnn` | Plain DFS (no CNN prior) |
 | `--train` | Train CNN before solving |
 | `--max-iterations` | DFS node budget (default 5,000,000) |
