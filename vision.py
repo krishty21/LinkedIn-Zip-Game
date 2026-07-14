@@ -47,7 +47,7 @@ import numpy as np
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_GAME_URL: str = "https://www.linkedin.com/games/zip"
+DEFAULT_GAME_URL: str = "https://www.linkedin.com/games/view/zip/desktop"
 PERSISTENT_CONTEXT_DIR: Path = Path(__file__).resolve().parent / ".browser_data"
 
 
