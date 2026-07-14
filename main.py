@@ -2,12 +2,9 @@
 main.py — Master orchestration (Optimized v2)
 ==============================================
 
-Chains all phases: setup → vision → solver → executor → packaging.
+Chains: vision → solver → executor.
 
 CLI:
-    --skip-setup      Skip Phase 1
-    --solve-only      Skip packaging
-    --package-only    Only rebuild zip
     --headless        Headless browser
     --no-cnn          Plain DFS (no CNN prior)
     --train           Train CNN before solving
@@ -32,20 +29,6 @@ from solver import SolverConfig, solve as solve_state
 from vision import VisionError, capture_state
 
 
-def run_phase1_setup() -> bool:
-    print("\n=== Phase 1: Environment setup ===")
-    script = PROJECT_ROOT / "setup_env.py"
-    if not script.exists():
-        print(f"[main] setup_env.py not found at {script}")
-        return False
-    try:
-        r = subprocess.run([sys.executable, str(script)], cwd=str(PROJECT_ROOT))
-        return r.returncode == 0
-    except OSError as exc:
-        print(f"[main] Phase 1 failed: {exc}")
-        return False
-
-
 def run_training() -> bool:
     print("\n=== Training CNN model ===")
     script = PROJECT_ROOT / "train.py"
@@ -63,16 +46,16 @@ def run_training() -> bool:
         return False
 
 
-async def run_phase2_vision(headless: bool):
-    print("\n=== Phase 2: Vision & state capture ===")
+async def run_vision(headless: bool):
+    print("\n=== Vision & state capture ===")
     try:
         page, state = await capture_state(headless=headless)
     except VisionError as exc:
         print(f"[main] Vision error: {exc}")
         return None, None
-    except Exception as exc:
+    except Exception:
         import traceback
-        print(f"[main] Unexpected vision error:")
+        print("[main] Unexpected vision error:")
         traceback.print_exc()
         return None, None
 
@@ -83,8 +66,8 @@ async def run_phase2_vision(headless: bool):
     return page, state
 
 
-def run_phase3_solver(state, max_iterations: int, use_cnn: bool):
-    print("\n=== Phase 3: Hybrid DFS + CNN solver ===")
+def run_solver(state, max_iterations: int, use_cnn: bool):
+    print("\n=== Hybrid DFS + CNN solver ===")
     config = SolverConfig(
         max_iterations=max_iterations,
         use_cnn_prior=use_cnn,
@@ -98,8 +81,8 @@ def run_phase3_solver(state, max_iterations: int, use_cnn: bool):
     return path
 
 
-async def run_phase4_executor(page, state, path) -> bool:
-    print("\n=== Phase 4: Autonomous input execution ===")
+async def run_executor(page, state, path) -> bool:
+    print("\n=== Autonomous input execution ===")
     if page is None:
         print("[main] No live page — skipping execution.")
         return False
@@ -110,55 +93,31 @@ async def run_phase4_executor(page, state, path) -> bool:
     return ok
 
 
-def run_phase5_package() -> bool:
-    print("\n=== Phase 5: Project packaging ===")
-    script = PROJECT_ROOT / "package.py"
-    if not script.exists():
-        print(f"[main] package.py not found")
-        return False
-    try:
-        r = subprocess.run([sys.executable, str(script)], cwd=str(PROJECT_ROOT))
-        return r.returncode == 0
-    except OSError as exc:
-        print(f"[main] Phase 5 failed: {exc}")
-        return False
-
-
 async def amain(args: argparse.Namespace) -> int:
-    if not args.skip_setup and not args.package_only:
-        if not run_phase1_setup():
-            print("[main] Phase 1 failed — aborting.")
-            return 1
-
-    if args.package_only:
-        return 0 if run_phase5_package() else 1
-
     if args.train:
         run_training()
 
-    page, state = await run_phase2_vision(headless=args.headless)
+    page, state = await run_vision(headless=args.headless)
     if state is None:
-        print("[main] Phase 2 failed — aborting.")
+        print("[main] Vision failed — aborting.")
         return 1
 
-    path = run_phase3_solver(state,
-                             max_iterations=args.max_iterations,
-                             use_cnn=not args.no_cnn)
+    path = run_solver(state,
+                      max_iterations=args.max_iterations,
+                      use_cnn=not args.no_cnn)
     if path is None:
         return 1
 
-    await run_phase4_executor(page, state, path)
-
-    if not args.solve_only:
-        run_phase5_package()
+    await run_executor(page, state, path)
     return 0
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LinkedIn Zip solver.")
-    p.add_argument("--skip-setup", action="store_true")
-    p.add_argument("--solve-only", action="store_true")
-    p.add_argument("--package-only", action="store_true")
+    p.add_argument("--skip-setup", action="store_true",
+                   help="(Legacy, kept for compatibility.)")
+    p.add_argument("--solve-only", action="store_true",
+                   help="(Legacy, kept for compatibility.)")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--no-cnn", action="store_true")
     p.add_argument("--train", action="store_true",

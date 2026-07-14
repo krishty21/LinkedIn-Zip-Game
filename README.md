@@ -1,44 +1,64 @@
 # LinkedIn Zip Solver (Optimized v2)
 
-A hybrid ML / constraint-programming pipeline that solves the LinkedIn
-**Zip** puzzle game via browser automation.
+A hybrid ML + constraint-programming pipeline that **autonomously solves** the
+LinkedIn **Zip** puzzle game via browser automation.
 
-## What's new in v2
+## Features
 
-* **DOM-first vision**: reads cell data directly from the page DOM
-  (`[data-cell-idx]`, `aria-label`) for pixel-perfect accuracy — no OCR.
-* **Color-based wall detection**: compares each cell's background against
-  the active (white) cell colour to detect invisible beige walls.
-* **Edge Wall Detection**: Extracts internal black walls using OpenCV by scanning pixel gaps between cells on the raw screenshot, preventing the solver from clipping through internal obstacles.
-* **Optimized solver**: Warnsdorff-style heuristic move ordering + deadlock detection + connectedness pruning + **strict mathematical edge routing**.
-* **Trained CNN**: ships with `zip_cnn.pth` weights trained on 500+ synthetic boards. Used as a move-ordering prior; falls back to plain DFS if torch is unavailable.
-* **Blazing Fast Executor**: Configured for near-instantaneous drawing of straight lines (sub-millisecond delay) with zero jitter.
-* **Robust types**: the `'str' // int` crash from v1 is eliminated via universal type coercion.
+* **DOM-first vision** — reads cell data directly from the page DOM
+  (`[data-cell-idx]`, `aria-label`) for pixel-perfect accuracy. No OCR.
+* **Color-based wall detection** — compares each cell's computed background
+  against the dominant board colour to detect invisible beige walls.
+* **Edge wall detection** — uses OpenCV to scan pixel midpoints between
+  adjacent cells, building strict `h_walls` / `v_walls` matrices that prevent
+  the solver from clipping through internal black walls.
+* **Optimized DFS solver** — Warnsdorff-style heuristic move ordering +
+  deadlock detection + connectedness pruning + strict edge routing.
+* **Trained CNN prior** — ships with `zip_cnn.pth` (500+ synthetic boards).
+  Used for move-ordering; falls back to plain DFS if PyTorch is unavailable.
+* **Blazing-fast executor** — direct cell-to-cell mouse movement with
+  sub-millisecond delays. No Bezier interpolation needed.
+* **Dry-run mode** — solve random synthetic boards locally without a browser
+  or LinkedIn login (unlimited retries for testing).
 
-## Quick start
+## Quick Start
 
 ```bash
-# 2. Train the CNN (optional but recommended — ~2 min on CPU)
-./venv/bin/python train.py --num-games 500 --epochs 25
+# 1. Create a virtual environment & install dependencies
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # macOS / Linux
+pip install -r requirements.txt
+python -m playwright install chromium
 
-# 3. Run the full pipeline
-./venv/bin/python main.py --skip-setup
+# 2. Train the CNN (optional — weights are included)
+python train.py --num-games 500 --epochs 25
 
-# Headless solve (requires prior login):
-./venv/bin/python main.py --skip-setup --headless --solve-only
+# 3. Run the full pipeline (opens Chrome, solves the puzzle)
+python main.py --solve-only --skip-setup
 
+# 4. Headless solve (requires prior login):
+python main.py --solve-only --skip-setup --headless
 ```
+
+## Notebook
+
+Open **`setup_notebook.ipynb`** in Jupyter for an interactive experience:
+
+1. Set `LOGGED_IN = True` to solve the **real LinkedIn puzzle** (once per day).
+2. Set `LOGGED_IN = False` to run a **dry-run** on synthetic boards — no
+   browser, no login, unlimited retries.
 
 ## Architecture
 
 ### Vision (`vision.py`)
 
-1. **Primary**: DOM extraction via `page.evaluate()`. Queries every
-   `[data-cell-idx]` element, reads `aria-label` for waypoint numbers,
-   and `getComputedStyle().backgroundColor` for wall detection (using global mode).
-2. **Edge Walls**: Crops the grid from a full-page OpenCV screenshot and scans the exact midpoints between all adjacent cells to build a strict `h_walls` and `v_walls` matrix.
-3. **Fallback**: OpenCV adaptive-threshold + Hough-line grid detection
-   on a screenshot, used only if DOM extraction fails.
+1. **DOM extraction** via `page.evaluate()` — queries every `[data-cell-idx]`
+   element, reads `aria-label` for waypoint numbers, and
+   `getComputedStyle().backgroundColor` for wall detection.
+2. **Edge walls** — crops the grid from a full-page screenshot and scans
+   midpoints between cells to build `h_walls` and `v_walls` matrices.
+3. **Fallback** — OpenCV adaptive-threshold grid detection if DOM fails.
 
 ### Solver (`solver.py` + `model.py`)
 
@@ -54,10 +74,8 @@ A hybrid ML / constraint-programming pipeline that solves the LinkedIn
 
 ### Executor (`executor.py`)
 
-* Cubic Bezier interpolation between cell centres.
-* Adaptive step count (straight = fewer, corners = more).
-* Tapered jitter (zero at cell centres so endpoints are exact).
-* Retry on failure with slower, smoother parameters.
+* Direct cell-centre-to-cell-centre mouse movement.
+* Retry on failure with slower parameters.
 
 ### Training (`train.py`)
 
@@ -65,38 +83,33 @@ A hybrid ML / constraint-programming pipeline that solves the LinkedIn
 * Uses the true solution path as supervision.
 * AlphaZero-style composite loss: policy cross-entropy + value MSE.
 
-## CLI flags (`main.py`)
+## CLI Flags (`main.py`)
 
 | Flag | Effect |
 |------|--------|
-| `--skip-setup` | Skip Phase 1 |
+| `--skip-setup` | Skip environment setup phase |
 | `--solve-only` | Skip packaging |
-| `--package-only` | Rebuild zip only |
-| `--headless` | Headless browser |
-| `--no-cnn` | Plain DFS (no CNN) |
+| `--headless` | Run browser headlessly |
+| `--no-cnn` | Plain DFS (no CNN prior) |
 | `--train` | Train CNN before solving |
 | `--max-iterations` | DFS node budget (default 5,000,000) |
 
-## Notebook
-
-Open `setup_notebook.ipynb` in Jupyter to:
-1. Verify the environment.
-2. Run synthetic solver tests (5 boards).
-3. Train the CNN.
-4. Launch the live solver against LinkedIn.
-
-## File layout
+## File Layout
 
 ```
 linkedin_zip_solver/
-├── vision.py          # DOM-first grid parser
-├── solver.py          # DFS + CNN + pruning
-├── model.py           # PyTorch CNN (graceful fallback)
-├── executor.py        # Bezier mouse drag
-├── train.py           # Synthetic self-play trainer
-├── main.py            # orchestrator
-├── requirements.txt   # dependency pin set
-├── setup_notebook.ipynb
-├── zip_cnn.pth        # trained weights (optional)
+├── vision.py            # DOM-first grid parser + edge wall detection
+├── solver.py            # DFS + CNN + pruning
+├── model.py             # PyTorch CNN (graceful fallback)
+├── executor.py          # Fast mouse drag execution
+├── train.py             # Synthetic self-play trainer
+├── main.py              # CLI orchestrator
+├── requirements.txt     # Dependencies
+├── setup_notebook.ipynb # Interactive Jupyter notebook
+├── zip_cnn.pth          # Pre-trained CNN weights
 └── README.md
 ```
+
+## License
+
+MIT
