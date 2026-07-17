@@ -55,7 +55,7 @@ MOVES: List[Tuple[int, int]] = [
 @dataclass(slots=True)
 class SolverConfig:
     max_iterations: int = 5_000_000
-    use_cnn_prior: bool = True
+    use_cnn_prior: bool = False   # OFF by default: CNN costs ~0.5ms/node, heuristic alone is 10-80x faster
     use_heuristic_prior: bool = True   # Warnsdorff-style ordering
     use_deadlock_check: bool = True
     cnn_device: str = "cpu"
@@ -145,37 +145,34 @@ def _has_deadlock(
     v_walls=None,
 ) -> bool:
     """
-    Detect simple deadlocks:
-      * A single unvisited cell with only one neighbour (and that
-        neighbour is the current cell) is fine — we can reach it. But
-        a single unvisited cell with NO unvisited neighbours (other
-        than through the current path) is a deadlock.
-      * A 2×2 block of unvisited cells fully surrounded by walls/edge
-        with only one entrance is a deadlock if we're not adjacent to
-        that entrance.
+    Local deadlock detection: check if any unvisited cell within distance-2
+    of the current position has become completely cut off (0 unvisited or
+    current-position neighbours).
 
-    For performance, we only check the "single isolated cell" case,
-    which catches the vast majority of deadlocks in practice.
+    We only need to check the local neighbourhood because a cell farther
+    than 2 steps away cannot have been newly isolated by the move we just
+    made. This makes the check O(1) instead of O(rows*cols).
     """
     rows, cols = grid.shape
-    unvisited = (grid != int(CellType.WALL)) & (~visited)
+    # Candidates: all cells within a 5x5 window centred on (cur_r, cur_c).
+    r0 = max(0, cur_r - 2)
+    r1 = min(rows, cur_r + 3)
+    c0 = max(0, cur_c - 2)
+    c1 = min(cols, cur_c + 3)
 
-    # Check: is there any unvisited cell (not adjacent to current pos)
-    # that has exactly 0 unvisited neighbours? That cell can never be
-    # reached.
-    for r in range(rows):
-        for c in range(cols):
-            if not unvisited[r, c]:
+    for r in range(r0, r1):
+        for c in range(c0, c1):
+            if visited[r, c] or grid[r, c] == int(CellType.WALL):
                 continue
-            # Count unvisited neighbours.
+            # Count reachable unvisited neighbours.
             nb = 0
             for dr, dc in MOVES:
                 nr, nc = r + dr, c + dc
-                if (can_move(grid, h_walls, v_walls, r, c, nr, nc)
-                        and unvisited[nr, nc]):
-                    nb += 1
-                elif (nr, nc) == (cur_r, cur_c):
-                    nb += 1  # current position counts as a neighbour
+                if can_move(grid, h_walls, v_walls, r, c, nr, nc):
+                    if not visited[nr, nc]:
+                        nb += 1
+                    elif (nr, nc) == (cur_r, cur_c):
+                        nb += 1  # current cell counts as accessible
             if nb == 0:
                 return True
     return False
@@ -223,6 +220,9 @@ class ZipSolver:
         self.prunes_wp: int = 0
         self.prunes_deadlock: int = 0
 
+        # Cache: total non-wall cells (used every DFS node — must not recompute).
+        self._total_cells: int = int((self.grid != int(CellType.WALL)).sum())
+
     # ------------------------------------------------------------------
     # Move ordering
     # ------------------------------------------------------------------
@@ -244,6 +244,10 @@ class ZipSolver:
             legal.append(idx)
 
         if not legal:
+            return legal
+
+        # Skip CNN when only one legal move — no ordering benefit, pure overhead.
+        if len(legal) == 1:
             return legal
 
         # CNN prior.
@@ -317,16 +321,12 @@ class ZipSolver:
         path: List[Tuple[int, int]] = [(sr, sc)]
 
         if self.config.verbose:
-            print(f"[solver] start={self.state.start} goal={self.state.goal} "
-                  f"waypoints={self.waypoints} grid={self.rows}x{self.cols}")
+            print(f"Figuring out the best path...")
 
         ok = self._dfs(sr, sc, gr, gc, visited, next_wp, path)
 
         if self.config.verbose:
-            print(f"[solver] nodes={self.nodes_explored} "
-                  f"prunes_conn={self.prunes_conn} "
-                  f"prunes_wp={self.prunes_wp} "
-                  f"prunes_dl={self.prunes_deadlock}")
+            print(f"Explored {self.nodes_explored} possibilities to find the answer.")
         return path if ok else None
 
     def _dfs(self, r, c, gr, gc, visited, next_wp_idx, path) -> bool:
@@ -334,11 +334,9 @@ class ZipSolver:
         if self.nodes_explored > self.config.max_iterations:
             return False
 
-        total_cells = int((self.grid != int(CellType.WALL)).sum())
-
         # Goal check.
         if (r, c) == (gr, gc):
-            if (int(visited.sum()) == total_cells
+            if (int(visited.sum()) == self._total_cells
                     and next_wp_idx >= len(self.waypoints)):
                 return True
             return False
@@ -362,7 +360,7 @@ class ZipSolver:
 
             # Prune: goal timing.
             if (nr, nc) == (gr, gc):
-                if int(visited.sum()) + 1 < total_cells:
+                if int(visited.sum()) + 1 < self._total_cells:
                     continue
 
             # Apply move.
@@ -377,9 +375,8 @@ class ZipSolver:
                 path.pop()
                 continue
 
-            # Prune: deadlock (only every 8 nodes for performance).
+            # Prune: deadlock (local O(1) check — run on every node).
             if (self.config.use_deadlock_check
-                    and self.nodes_explored % 8 == 0
                     and _has_deadlock(self.grid, visited, nr, nc, self.state.h_walls, self.state.v_walls)):
                 self.prunes_deadlock += 1
                 visited[nr, nc] = False

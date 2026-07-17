@@ -90,12 +90,22 @@ def build_drag_path(
     rng: Optional[random.Random] = None,
 ) -> List[PixelPoint]:
     """Convert a grid path into a pixel-space trajectory.
-    
-    Since we use zero jitter and zero bezier offset, we skip all the
-    expensive cubic Bezier math and just emit cell centres directly.
-    This cuts the trajectory from hundreds of points to exactly N points.
+
+    Uses DOM-extracted Cell.pixel_center values when available (most accurate),
+    falling back to the calculated pixel_of() if a cell is missing.
     """
-    return [state.pixel_of(r, c) for (r, c) in grid_path]
+    # Build a fast lookup from (row, col) -> pixel center.
+    cell_pixels: dict = {}
+    for cell in state.cells:
+        cell_pixels[(cell.row, cell.col)] = cell.pixel_center
+
+    result = []
+    for (r, c) in grid_path:
+        px = cell_pixels.get((r, c))
+        if px is None:
+            px = state.pixel_of(r, c)  # fallback
+        result.append(px)
+    return result
 
 
 def validate_path(grid_path: List[Tuple[int, int]]) -> bool:
@@ -123,12 +133,11 @@ async def execute_path(
 ) -> bool:
     """Drag the solved path through the canvas via Playwright mouse API."""
     if not grid_path:
-        print("[executor] Empty path — nothing to execute.")
+        print("No path to execute.")
         return False
 
     if not validate_path(grid_path):
-        print("[executor] WARNING: path is not contiguous — "
-              "execution may fail.")
+        print("Warning: the path seems disconnected, but I'll try my best.")
 
     config = config or ExecutorConfig()
     rng = rng or random.Random()
@@ -151,15 +160,15 @@ async def execute_path(
         ok = await _single_drag(page, grid_path, state, cfg, rng)
         if ok:
             return True
-        print(f"[executor] Attempt {attempt + 1} failed, retrying...")
+        print(f"Oops, attempt {attempt + 1} failed. Let me try again...")
 
     return False
 
 
 async def _single_drag(page, grid_path, state, config, rng) -> bool:
     trajectory = build_drag_path(grid_path, state, config, rng)
-    start_px = state.pixel_of(*grid_path[0])
-    end_px = state.pixel_of(*grid_path[-1])
+    start_px = trajectory[0]   # DOM-accurate pixel center of start cell
+    end_px = trajectory[-1]    # DOM-accurate pixel center of goal cell
 
     try:
         # Pre-drag hover.
@@ -182,7 +191,7 @@ async def _single_drag(page, grid_path, state, config, rng) -> bool:
         await page.mouse.up()
         return True
     except Exception as exc:
-        print(f"[executor] Drag error: {exc}")
+        print(f"Ran into an issue while dragging: {exc}")
         try:
             await page.mouse.up()
         except Exception:

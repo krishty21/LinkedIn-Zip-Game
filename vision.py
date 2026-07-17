@@ -47,7 +47,8 @@ import numpy as np
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_GAME_URL: str = "https://www.linkedin.com/games/view/zip/desktop"
+DEFAULT_GAME_URL: str = "https://www.linkedin.com/games/zip"
+GUEST_GAME_URL: str = "https://www.linkedin.com/games/view/zip/desktop"
 PERSISTENT_CONTEXT_DIR: Path = Path(__file__).resolve().parent / ".browser_data"
 
 
@@ -430,30 +431,64 @@ def build_state_from_dom(
         screenshot=screenshot,
     )
     
-    # Detect internal edge walls if screenshot is available
+    # Detect internal edge walls using screenshot pixel analysis.
+    # Real thick walls have nearly-black pixels between cells (mean < 30).
+    # Regular thin grid lines are light grey (mean > 60).
+    state.h_walls = np.zeros((rows, cols), dtype=bool)
+    state.v_walls = np.zeros((rows, cols), dtype=bool)
+
     if screenshot is not None:
-        state.h_walls = np.zeros((rows, cols), dtype=bool)
-        state.v_walls = np.zeros((rows, cols), dtype=bool)
-        
+        # Build a lookup from cell idx -> bounding rect from DOM
+        idx_to_rect: Dict[int, Dict] = {}
+        for cd in cells_data:
+            idx = _to_int(cd.get('idx', -1))
+            idx_to_rect[idx] = {
+                'x': _to_float(cd.get('x', 0)),
+                'y': _to_float(cd.get('y', 0)),
+                'w': _to_float(cd.get('w', 0)),
+                'h': _to_float(cd.get('h', 0)),
+            }
+
+        DARK_THRESHOLD = 30  # mean brightness below this = real black wall
+
         for r in range(rows):
             for c in range(cols):
-                cx, cy = state.pixel_of(r, c)
-                
-                # Check vertical wall (to the right)
-                if c < cols - 1:
-                    cx_right, _ = state.pixel_of(r, c + 1)
-                    mid_x = (cx + cx_right) // 2
-                    slice_img = screenshot[max(0, cy-5):cy+5, max(0, mid_x-2):mid_x+2]
-                    if slice_img.size > 0 and np.mean(slice_img) < 100:
-                        state.v_walls[r, c] = True
-                
-                # Check horizontal wall (below)
-                if r < rows - 1:
-                    _, cy_down = state.pixel_of(r + 1, c)
-                    mid_y = (cy + cy_down) // 2
-                    slice_img = screenshot[max(0, mid_y-2):mid_y+2, max(0, cx-5):cx+5]
-                    if slice_img.size > 0 and np.mean(slice_img) < 100:
-                        state.h_walls[r, c] = True
+                idx_cur = r * cols + c
+                rect_cur = idx_to_rect.get(idx_cur)
+                if rect_cur is None:
+                    continue
+                cx, cy = rect_cur['x'], rect_cur['y']
+                cw, ch = rect_cur['w'], rect_cur['h']
+
+                # Check RIGHT wall: sample vertical strip between this cell and right neighbor
+                if c + 1 < cols:
+                    idx_r = r * cols + (c + 1)
+                    rect_r = idx_to_rect.get(idx_r)
+                    if rect_r is not None:
+                        mid_x = int((cx + cw + rect_r['x']) / 2)
+                        strip_y1 = int(cy + ch * 0.2)
+                        strip_y2 = int(cy + ch * 0.8)
+                        if 0 <= mid_x < screenshot.shape[1] and strip_y1 < strip_y2:
+                            strip = screenshot[strip_y1:strip_y2, max(0, mid_x-2):mid_x+3]
+                            if strip.size > 0 and np.mean(strip) < DARK_THRESHOLD:
+                                state.v_walls[r, c] = True
+
+                # Check BOTTOM wall: sample horizontal strip between this cell and bottom neighbor
+                if r + 1 < rows:
+                    idx_d = (r + 1) * cols + c
+                    rect_d = idx_to_rect.get(idx_d)
+                    if rect_d is not None:
+                        mid_y = int((cy + ch + rect_d['y']) / 2)
+                        strip_x1 = int(cx + cw * 0.2)
+                        strip_x2 = int(cx + cw * 0.8)
+                        if 0 <= mid_y < screenshot.shape[0] and strip_x1 < strip_x2:
+                            strip = screenshot[max(0, mid_y-2):mid_y+3, strip_x1:strip_x2]
+                            if strip.size > 0 and np.mean(strip) < DARK_THRESHOLD:
+                                state.h_walls[r, c] = True
+
+    if not state.h_walls.any() and not state.v_walls.any():
+        state.h_walls = None
+        state.v_walls = None
 
     return state
 
@@ -542,28 +577,32 @@ async def _navigate_and_wait(page, game_url: str, timeout_ms: int) -> None:
     """Navigate to the game URL and wait for the board to render."""
     await page.goto(game_url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-    for selector in [
-        "button:has-text('Play')",
-        "button:has-text('Start now')",
-        "button:has-text('Start')",
-        "button:has-text('Continue')",
-    ]:
-        try:
-            btn = page.locator(selector).first
-            await btn.wait_for(state="visible", timeout=3000)
-            await btn.click()
-            await asyncio.sleep(0.5)
-        except Exception:
-            pass
-
-    # Wait for the grid to render using a combined selector.
-    try:
-        combined_selector = "[data-testid='interactive-grid'], [data-cell-idx], canvas"
-        loc = page.locator(combined_selector).first
-        await loc.wait_for(state="visible", timeout=timeout_ms)
-        return
-    except Exception:
-        pass
+    start_time = asyncio.get_event_loop().time()
+    while (asyncio.get_event_loop().time() - start_time) * 1000 < timeout_ms:
+        # Check if grid is already visible
+        grid_loc = page.locator("[data-testid='interactive-grid'], [data-cell-idx], canvas").first
+        if await grid_loc.is_visible():
+            # Give the page an extra 2 seconds to fully render the wall elements
+            # (the thick black L-shaped barriers render slightly after the grid)
+            await asyncio.sleep(2.0)
+            return
+            
+        # Check if a start button is visible
+        combined_btn_selector = (
+            "button:has-text('Play'), "
+            "button:has-text('Start now'), "
+            "button:has-text('Start'), "
+            "button:has-text('Continue')"
+        )
+        btn = page.locator(combined_btn_selector).first
+        if await btn.is_visible():
+            try:
+                await btn.click()
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+                
+        await asyncio.sleep(0.1)
     raise VisionError(
         f"No visible game board found after {timeout_ms//1000}s. Make sure you click 'Start Game'."
     )
@@ -646,14 +685,14 @@ async def capture_state(
         dom_state = await _extract_dom_state(page)
         if dom_state is not None and dom_state.get('count', 0) > 0:
             state = build_state_from_dom(dom_state, screenshot=screenshot)
-            print(f"[vision] DOM extraction: {state.shape[0]}x{state.shape[1]} grid, "
+            print(f"Read {state.shape[0]}x{state.shape[1]} grid from the page, "
                   f"{len(state.numbers)} waypoints")
             return page, state
 
         # Fallback: OpenCV on the screenshot.
         if screenshot is not None and bbox[2] > 50:
             state = parse_canvas_fallback(screenshot, bbox)
-            print(f"[vision] OpenCV fallback: {state.shape[0]}x{state.shape[1]} grid")
+            print(f"Fallback vision parsed a {state.shape[0]}x{state.shape[1]} grid")
             return page, state
 
         raise VisionError(
