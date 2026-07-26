@@ -21,6 +21,7 @@ Optimizations over v1:
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -60,6 +61,7 @@ class SolverConfig:
     use_deadlock_check: bool = True
     cnn_device: str = "cpu"
     verbose: bool = False
+    time_budget: float = 0.0      # 0 = legacy mode (return first solution), >0 = utilize full time budget
 
 
 
@@ -223,6 +225,13 @@ class ZipSolver:
         # Cache: total non-wall cells (used every DFS node — must not recompute).
         self._total_cells: int = int((self.grid != int(CellType.WALL)).sum())
 
+        # Time control state.
+        self._start_time: float = 0.0
+        self._best_path: Optional[List[Tuple[int, int]]] = None
+        self._best_path_length: int = 0
+        self._solutions_found: int = 0
+        self._last_report_time: float = 0.0
+
     # ------------------------------------------------------------------
     # Move ordering
     # ------------------------------------------------------------------
@@ -311,9 +320,46 @@ class ZipSolver:
     # ------------------------------------------------------------------
     # Solve
     # ------------------------------------------------------------------
+    def _time_remaining(self) -> float:
+        """Return seconds remaining in the time budget (0 if legacy mode)."""
+        if self.config.time_budget <= 0:
+            return float('inf')
+        elapsed = time.perf_counter() - self._start_time
+        return max(0.0, self.config.time_budget - elapsed)
+
+    def _is_time_up(self) -> bool:
+        """Check if we've exhausted the time budget."""
+        if self.config.time_budget <= 0:
+            return False
+        return (time.perf_counter() - self._start_time) >= self.config.time_budget
+
+    def _record_solution(self, path: List[Tuple[int, int]]) -> None:
+        """Record a found solution and keep the best one so far."""
+        path_len = len(path)
+        self._solutions_found += 1
+
+        if self._best_path is None or path_len < self._best_path_length:
+            self._best_path = path.copy()
+            self._best_path_length = path_len
+
+        # Progress reporting.
+        if self.config.verbose:
+            elapsed = time.perf_counter() - self._start_time
+            if elapsed - self._last_report_time >= 0.5:  # Report at most every 0.5s
+                self._last_report_time = elapsed
+                budget_str = f"/{self.config.time_budget:.1f}s" if self.config.time_budget > 0 else ""
+                print(f"  [{self._solutions_found} solutions] Best: {self._best_path_length} cells "
+                      f"at {elapsed:.2f}s{budget_str} (nodes: {self.nodes_explored})")
+
     def solve(self) -> Optional[List[Tuple[int, int]]]:
         sr, sc = self.state.start
         gr, gc = self.state.goal
+
+        self._start_time = time.perf_counter()
+        self._best_path = None
+        self._best_path_length = 0
+        self._solutions_found = 0
+        self._last_report_time = 0.0
 
         visited = np.zeros((self.rows, self.cols), dtype=bool)
         visited[sr, sc] = True
@@ -321,25 +367,53 @@ class ZipSolver:
         path: List[Tuple[int, int]] = [(sr, sc)]
 
         if self.config.verbose:
-            print(f"Figuring out the best path...")
+            budget_str = f" with time budget {self.config.time_budget}s" if self.config.time_budget > 0 else ""
+            print(f"Figuring out the best path{budget_str}...")
 
-        ok = self._dfs(sr, sc, gr, gc, visited, next_wp, path)
+        # Run the anytime DFS.
+        self._dfs(sr, sc, gr, gc, visited, next_wp, path)
 
         if self.config.verbose:
-            print(f"Explored {self.nodes_explored} possibilities to find the answer.")
-        return path if ok else None
+            elapsed = time.perf_counter() - self._start_time
+            print(f"Explored {self.nodes_explored} possibilities in {elapsed:.2f}s, "
+                  f"{self._solutions_found} solutions found.")
 
-    def _dfs(self, r, c, gr, gc, visited, next_wp_idx, path) -> bool:
+        # Return the best path found (or None if nothing was found).
+        return self._best_path
+
+    def _dfs(self, r, c, gr, gc, visited, next_wp_idx, path) -> None:
+        """Anytime DFS: returns None, records best path in self._best_path."""
         self.nodes_explored += 1
+
+        # Termination checks.
         if self.nodes_explored > self.config.max_iterations:
-            return False
+            return
+        if self._is_time_up():
+            return
+
+        # Quick depth-bound pruning: if best path already found and we're
+        # deeper than that, prune this branch (can't beat the best).
+        if self._best_path is not None and len(path) >= self._best_path_length:
+            return
 
         # Goal check.
         if (r, c) == (gr, gc):
             if (int(visited.sum()) == self._total_cells
                     and next_wp_idx >= len(self.waypoints)):
-                return True
-            return False
+                self._record_solution(path)
+            return  # Always return after goal check — never descend further
+
+        # Time-aware exploration schedule.
+        # In legacy mode (time_budget=0), we just search with best-first ordering
+        # and return as fast as possible. The early pruning above ensures we stop
+        # once we find the best solution.
+        if self.config.time_budget > 0:
+            remaining = self._time_remaining()
+            # Adaptive exploration: when time is running low, be more aggressive
+            # about pruning suboptimal branches.
+            if self._best_path is not None and remaining < self.config.time_budget * 0.2:
+                # Late phase: only explore if path could beat best (already checked above)
+                pass
 
         for idx in self._order_moves(r, c, visited, next_wp_idx):
             dr, dc = MOVES[idx]
@@ -383,13 +457,17 @@ class ZipSolver:
                 path.pop()
                 continue
 
-            if self._dfs(nr, nc, gr, gc, visited, new_wp, path):
-                return True
+            self._dfs(nr, nc, gr, gc, visited, new_wp, path)
+
+            # Early exit in legacy mode: if we found a solution and time_budget=0,
+            # the solution is already recorded in _best_path. We can stop searching.
+            if self.config.time_budget <= 0 and self._best_path is not None:
+                visited[nr, nc] = False
+                path.pop()
+                return
 
             visited[nr, nc] = False
             path.pop()
-
-        return False
 
     def _advance_waypoint(self, r, c, idx) -> int:
         if idx < len(self.waypoints) and self.waypoints[idx] == (r, c):

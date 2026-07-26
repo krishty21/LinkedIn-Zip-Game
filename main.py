@@ -13,14 +13,12 @@ CLI:
 """
 
 from __future__ import annotations
-
 import argparse
 import asyncio
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional
-
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -77,12 +75,13 @@ async def run_vision(headless: bool, guest: bool = False):
     return page, state
 
 
-def run_solver(state, max_iterations: int, use_cnn: bool):
+def run_solver(state, max_iterations: int, use_cnn: bool, time_budget: float = 0.0):
     print("\nRunning Hybrid DFS + Heuristic solver...")
     config = SolverConfig(
         max_iterations=max_iterations,
         use_cnn_prior=use_cnn,
         verbose=True,
+        time_budget=time_budget,
     )
     path = solve_state(state, config=config)
     if path is None:
@@ -115,7 +114,8 @@ async def amain(args: argparse.Namespace) -> int:
 
     path = run_solver(state,
                       max_iterations=args.max_iterations,
-                      use_cnn=args.use_cnn)
+                      use_cnn=args.use_cnn,
+                      time_budget=args.time_budget)
     if path is None:
         return 1
 
@@ -148,6 +148,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--train", action="store_true",
                    help="Train CNN before solving.")
     p.add_argument("--max-iterations", type=int, default=5_000_000)
+    p.add_argument("--time-budget", type=float, default=0.0,
+                   help="Time budget in seconds. 0 = legacy mode (return first solution immediately). "
+                        ">0 = utilize full time budget to find the best solution.")
     return p.parse_args(argv)
 
 

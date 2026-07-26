@@ -38,6 +38,7 @@ class ExecutorConfig:
     bezier_control_offset: float = 0.0
     pre_drag_hover_ms: float = 20.0
     max_retries: int = 2
+    execution_duration: float = 0.0  # 0 = legacy speed, >0 = utilize full duration (seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +181,24 @@ async def _single_drag(page, grid_path, state, config, rng) -> bool:
 
         # Walk the trajectory — skip intermediate Bezier points, just
         # hit cell centres directly for maximum speed.
-        for (x, y) in trajectory[1:-1]:
-            await page.mouse.move(x, y, steps=1)
-            if config.step_delay_ms > 0:
-                await asyncio.sleep(config.step_delay_ms / 1000.0)
+        num_mid_points = len(trajectory) - 2  # exclude start and goal
+        if config.execution_duration > 0 and num_mid_points > 0:
+            # Align total execution to match the desired duration.
+            # Calculate delay per move to fill the full budget.
+            phase_in_delay = config.hold_start_ms / 1000.0
+            hold_delay = config.hold_end_ms / 1000.0
+            hover_delay = config.pre_drag_hover_ms / 1000.0
+            move_budget = config.execution_duration - phase_in_delay - hold_delay - hover_delay
+            delay_per_move = max(0.001, move_budget / num_mid_points)
+            for (x, y) in trajectory[1:-1]:
+                await page.mouse.move(x, y, steps=1)
+                await asyncio.sleep(delay_per_move)
+        else:
+            # Legacy mode: fast execution.
+            for (x, y) in trajectory[1:-1]:
+                await page.mouse.move(x, y, steps=1)
+                if config.step_delay_ms > 0:
+                    await asyncio.sleep(config.step_delay_ms / 1000.0)
 
         # Land on goal.
         await page.mouse.move(end_px[0], end_px[1], steps=1)
