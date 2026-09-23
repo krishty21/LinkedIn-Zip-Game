@@ -17,6 +17,14 @@ venv.bak/
 cells.txt
 full_dom.html
 .browser_data/
+.browser_guest/
 chrome_profile/
 *.pth
 !zip_cnn.pth
+
+# IDE and tools
+.vscode/
+.idea/
+.ipynb_checkpoints/
+.pytest_cache/
+.claude/
